@@ -1,0 +1,351 @@
+import boto3
+import webbrowser
+import pandas as pd
+from botocore.exceptions import ClientError
+import os
+import time
+import json
+import datetime
+from datetime import timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from colorama import init, Fore, Style
+
+user_home = os.path.expanduser('~')
+sso_token_directory = f"{user_home}/.aws_sso/sso_tokens"
+filepath = os.path.join(sso_token_directory,'ssotoken.json')
+if not os.path.exists(sso_token_directory):
+    os.makedirs(sso_token_directory)
+if not os.path.isfile(filepath):
+    with open(filepath, 'w') as fp:
+        pass
+#AWS  SSO URL
+aws_sso_url = 'https://d-11111111.awsapps.com/start'
+
+aws_region = "us-east-1"
+sso_oidc_client = boto3.client('sso-oidc', region_name=aws_region)
+sso_client = boto3.client('sso',region_name=aws_region)
+
+
+#############################
+
+######## Custom fonts for notifications ###########
+
+def print_header(text):
+    print(f"\n{Fore.CYAN}{Style.BRIGHT}{text}{Style.RESET_ALL}")
+
+def print_success(text):
+    print(f"{Fore.GREEN}✔ {text}{Style.RESET_ALL}")
+
+def print_error(text):
+    print(f"{Fore.RED}✘ {text}{Style.RESET_ALL}")
+
+def print_warning(text):
+    print(f"{Fore.YELLOW}⚠ {text}{Style.RESET_ALL}")
+
+######################################################
+
+
+def get_aws_token():
+    """
+    Generates a new AWS SSO token, opens the browser for user authorization, and stores the token in the token file.
+    refer: https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/sso-oidc.html
+
+    Returns:
+        str: The newly generated AWS SSO token.
+
+    Raises:
+        RuntimeError: If the token cannot be generated or stored.
+    """
+    try:
+        # Register the SSO client
+        register_response = sso_oidc_client.register_client(
+            clientName="aws_sso_client",
+            clientType="public"
+        )
+        client_id = register_response['clientId']
+        client_secret = register_response['clientSecret']
+
+        # Start the device authorization flow
+        auth_response = sso_oidc_client.start_device_authorization(
+            clientId=client_id,
+            clientSecret=client_secret,
+            startUrl=aws_sso_url
+        )
+        device_code = auth_response['deviceCode']
+        verification_url = auth_response['verificationUriComplete']
+        expires_in = auth_response['expiresIn']
+
+        # Open the browser for user authorization
+        print_header("Authorization Required")
+        print(f"Opening the browser for authorization. If it doesn't open, visit the following URL manually:\n{verification_url}")
+        webbrowser.open(verification_url)
+
+        # Poll for the token
+        while True:
+            try:
+                token_response = sso_oidc_client.create_token(
+                    clientId=client_id,
+                    clientSecret=client_secret,
+                    grantType="urn:ietf:params:oauth:grant-type:device_code",
+                    deviceCode=device_code
+                )
+                break  # Exit the loop if the token is successfully retrieved
+            except sso_oidc_client.exceptions.AuthorizationPendingException:
+                # Wait for the user to complete the authorization
+                time.sleep(5)
+            except sso_oidc_client.exceptions.ExpiredTokenException:
+                print_error("The device authorization code has expired. Please restart the process.")
+                raise RuntimeError("Device authorization expired.")
+            except sso_oidc_client.exceptions.SlowDownException:
+                # Handle rate-limiting by waiting longer
+                time.sleep(10)
+
+        # Extract token details
+        access_token = token_response['accessToken']
+        token_expiration_time = datetime.datetime.now() + timedelta(seconds=token_response['expiresIn'])
+
+        # Save the token to the file
+        token_data = {
+            "token_details": access_token,
+            "token_expiration_time": token_expiration_time.strftime('%Y-%m-%d %H:%M:%S')
+        }
+        with open(filepath, 'w', encoding='utf-8') as token_file:
+            json.dump(token_data, token_file, indent=4)
+
+        print_success("AWS SSO token successfully generated and saved.")
+        return access_token
+
+    except ClientError as e:
+        print_error(f"Failed to generate AWS SSO token: {e}")
+        raise RuntimeError("Error generating AWS SSO token.") from e
+
+    except Exception as e:
+        print_error(f"An unexpected error occurred while generating the AWS SSO token: {e}")
+        raise RuntimeError("Unexpected error while generating AWS SSO token.") from e
+
+def execution_condition():
+    """
+    Checks if the AWS SSO token exists and is valid. If the token is missing or expired, a new one is generated.
+
+    Returns:
+        str: The valid AWS SSO token.
+
+    Raises:
+        RuntimeError: If the token cannot be generated or retrieved.
+    """
+    try:
+        # Check if the token file exists and is not empty
+        if not os.path.exists(filepath) or os.path.getsize(filepath) == 0:
+            print_warning("Token file is missing or empty. Generating a new token...")
+            return get_aws_token()
+
+        # Load the token data from the file
+        with open(filepath, 'r', encoding='utf-8') as js_file:
+            token_data = json.load(js_file)
+
+        # Parse the token expiration time
+        current_time = datetime.datetime.now()
+        token_expiration_time = datetime.datetime.strptime(
+            token_data['token_expiration_time'], '%Y-%m-%d %H:%M:%S'
+        )
+
+        # Check if the token is still valid
+        if token_expiration_time > current_time:
+            return token_data['token_details']
+        else:
+            print_warning("Token has expired. Generating a new token...")
+            return get_aws_token()
+        
+    # Handle issues with the token file (e.g., missing, corrupted, or invalid format)
+    except (FileNotFoundError, KeyError, ValueError) as e:
+
+        print_error(f"Token file is invalid or corrupted: {e}. Generating a new token...")
+        return get_aws_token()
+
+    except Exception as e:
+        # Handle unexpected errors
+        print_error(f"An unexpected error occurred while checking the token: {e}")
+        raise RuntimeError("Failed to retrieve or generate the AWS SSO token.") from e
+
+
+
+def retrieve_aws_credentials(account_id, selected_role):
+    """
+    Generates temporary AWS credentials for the specified account and role.
+
+    Parameters:
+        account_id (str): The AWS account ID.
+        selected_role (str): The role name to assume.
+
+    Returns:
+        boto3.Session: A boto3 session with temporary credentials.
+
+    Raises:
+        RuntimeError: If credentials cannot be retrieved.
+    """
+    # Retrieve role credentials using the SSO client
+    sts_creds = sso_client.get_role_credentials(
+        accessToken=execution_condition(),
+        roleName=selected_role,
+        accountId=account_id
+    )
+
+    # Extract credentials from the response
+    credentials = sts_creds.get('roleCredentials')
+    if not credentials:
+        raise ValueError(f"No valid credentials found for account '{account_id}' and role '{selected_role}'.")
+
+    # Create and return a boto3 session with the temporary credentials
+    session = boto3.Session(
+        aws_access_key_id=credentials['accessKeyId'],
+        aws_secret_access_key=credentials['secretAccessKey'],
+        aws_session_token=credentials['sessionToken']
+    )
+    return session
+
+
+
+
+def role_selector(account_name, account_id, **kwargs):
+    """
+    Maps SSO roles to environments and retrieves AWS credentials for the selected role.
+    Fallback logic: Primary role -> View-only role -> Special role 1 (if provided) -> Special role 2 (if provided).
+
+    Parameters:
+        account_name (str): The name of the AWS account.
+        account_id (str): The ID of the AWS account.
+        **kwargs: Keyword arguments for roles. Expected keys:
+            - dev_account_role (str): Role for development accounts.
+            - test_prod_account_role (str): Role for test and production accounts.
+            - view_only_role (str, optional): View-only role. Defaults to None.
+            - special_role1 (str, optional): Special role 1. Defaults to None.
+            - special_role2 (str, optional): Special role 2. Defaults to None.
+
+    Returns:
+        boto3.Session: AWS session with temporary credentials for the selected role.
+
+    Raises:
+        RuntimeError: If no valid role can retrieve credentials.
+    """
+    # Extract roles from kwargs with default values
+    dev_account_role = kwargs.get('dev_account_role')
+    test_prod_account_role = kwargs.get('test_prod_account_role')
+    view_only_role = kwargs.get('view_only_role', None)
+    special_role1 = kwargs.get('special_role1', None)
+    special_role2 = kwargs.get('special_role2', None)
+
+    # Determine the primary role based on the account name suffix
+    if account_name.lower().endswith(("-dev", "-inn")):
+        primary_role = dev_account_role
+    elif account_name.lower().endswith(("tst", "prd")):
+        primary_role = test_prod_account_role
+    else:
+        primary_role = None  # No specific primary role for this account
+
+    # Define the fallback roles in order of priority
+    roles_to_try = [primary_role, special_role1, special_role2,  view_only_role]
+
+    # Attempt to retrieve credentials for each role in order
+    for i, role in enumerate(roles_to_try):
+        if role:  # Skip if the role is None
+            try:
+                session = retrieve_aws_credentials(account_id, role)
+                return session  # Return the session if credentials are successfully retrieved
+            except Exception as e:
+                # Determine the next role if its available 
+                if i + 1 < len(roles_to_try):  
+                    next_role = roles_to_try[i + 1]  
+                    if not next_role: 
+                        next_role = "None"
+                else:
+                    next_role = "None"  
+
+                print_warning(f"Failed to retrieve credentials for role '{role}' in account '{account_name}'. Trying next role: '{next_role}'...")
+
+    # If all roles fail, raise an error
+    raise RuntimeError(f"Unable to retrieve credentials for account '{account_name}' (ID: {account_id}). No valid roles found.")
+
+def collect_aws_accounts_details():
+    """
+    Formats the account details and returns only account ID and account name in a DataFrame format.
+
+    Returns:
+        pd.DataFrame: A DataFrame containing AWS account IDs and names.
+
+    Raises:
+        RuntimeError: If the AWS accounts cannot be retrieved.
+    """
+    print_header("This execution is permitted only for aws accounts within the AWS landscape")
+    aws_sso_token = execution_condition()
+
+    try:
+            aws_accounts = []
+            next_token = None
+
+            while True:
+                if next_token:
+                    response = sso_client.list_accounts(
+                        accessToken=aws_sso_token,
+                        nextToken=next_token,
+                        maxResults=1000
+                    )
+                else:
+                    response = sso_client.list_accounts(
+                        accessToken=aws_sso_token,
+                        maxResults=1000
+                    )
+                
+                aws_accounts.extend(response.get('accountList', []))
+                next_token = response.get('nextToken')
+
+                if not next_token:
+                    break
+
+            if not aws_accounts:
+                raise RuntimeError('Unable to retrieve AWS SSO account list\n')
+
+            df_accounts = pd.DataFrame(aws_accounts)
+            account_df = df_accounts[["accountId", "accountName"]]
+            return account_df
+    except ClientError as e:
+        print_error(f"Failed to retrieve AWS accounts: {e}")
+        raise RuntimeError("Error retrieving AWS accounts.") from e
+
+    except Exception as e:
+        print_error(f"An unexpected error occurred: {e}")
+        raise RuntimeError("Unexpected error while retrieving AWS accounts.") from e
+
+
+def get_aws_roles(aws_account_id):
+    """
+    Retrieves the list of roles available for a given AWS account ID.
+
+    Parameters:
+        aws_account_id (str): The AWS account ID.
+
+    Returns:
+        list: A list of role names available for the specified account.
+
+    Raises:
+        RuntimeError: If the roles cannot be retrieved due to an error.
+    """
+    try:
+        # Call the SSO API to list account roles
+        account_roles_response = sso_client.list_account_roles(
+            accessToken=execution_condition(),
+            accountId=aws_account_id
+        )
+
+        # Retrieve the list of roles from the response
+
+        roles = [role['roleName'] for role in account_roles_response.get('roleList', [])]
+
+        return roles
+
+    except ClientError as e:
+        print_error(f"Failed to retrieve roles for account '{aws_account_id}': {e}")
+        raise RuntimeError(f"Error retrieving roles for account '{aws_account_id}'") from e
+
+    except Exception as e:
+        print_error(f"An unexpected error occurred while retrieving roles for account '{aws_account_id}': {e}")
+        raise RuntimeError(f"Unexpected error retrieving roles for account '{aws_account_id}'") from e        
